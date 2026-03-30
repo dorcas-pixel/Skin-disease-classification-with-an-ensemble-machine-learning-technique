@@ -1,0 +1,221 @@
+import numpy as np
+import pandas as pd
+import time
+import cv2
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import GradientBoostingClassifier, VotingClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.preprocessing import StandardScaler
+
+from skimage.feature import graycomatrix, graycoprops
+from scipy import stats
+
+# ==============================
+# 1. LOAD DATASET (CSV FORMAT)
+# ==============================
+
+# CSV must contain: image_path, label
+data = pd.read_csv("ISIC2018.csv")
+
+image_paths = data['image_path'].values
+labels = data['label'].values
+
+# ==============================
+# 2. GLCM FEATURE EXTRACTION
+# ==============================
+
+def extract_glcm_features(image_path):
+    img = cv2.imread(image_path)
+    img = cv2.resize(img, (128, 128))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    glcm = graycomatrix(gray, distances=[1], angles=[0],
+                        levels=256, symmetric=True, normed=True)
+
+    contrast = graycoprops(glcm, 'contrast')[0, 0]
+    homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
+    energy = graycoprops(glcm, 'energy')[0, 0]
+    correlation = graycoprops(glcm, 'correlation')[0, 0]
+
+    mean = np.mean(gray)
+    std = np.std(gray)
+
+    return [contrast, homogeneity, energy, correlation, mean, std]
+
+print("Extracting GLCM features...")
+
+features = []
+for path in image_paths:
+    features.append(extract_glcm_features(path))
+
+X = np.array(features)
+y = np.array(labels)
+
+# ==============================
+# 3. FEATURE SCALING
+# ==============================
+
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# ==============================
+# 4. DEFINE LIGHTWEIGHT ENSEMBLE
+# ==============================
+
+knn = KNeighborsClassifier(n_neighbors=5)
+dt = DecisionTreeClassifier(max_depth=5)
+gbm = GradientBoostingClassifier(n_estimators=50)
+
+ensemble = VotingClassifier(
+    estimators=[('knn', knn), ('dt', dt), ('gbm', gbm)],
+    voting='hard'
+)
+
+# ==============================
+# 5. FUNCTION: EVALUATION
+# ==============================
+
+def evaluate_model(X_train, X_test, y_train, y_test, title):
+    start_train = time.time()
+    ensemble.fit(X_train, y_train)
+    train_time = time.time() - start_train
+
+    start_test = time.time()
+    y_pred = ensemble.predict(X_test)
+    test_time = time.time() - start_test
+
+    acc = accuracy_score(y_test, y_pred)
+
+    print(f"\n=== {title} ===")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Training Time (CPU): {train_time:.4f}s")
+    print(f"Inference Time (CPU): {test_time:.4f}s")
+
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+
+    cm = confusion_matrix(y_test, y_pred)
+
+    plt.figure()
+    sns.heatmap(cm, annot=True, fmt='d')
+    plt.title(f"Confusion Matrix - {title}")
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.show()
+
+    return acc, train_time, test_time
+
+# ==============================
+# 6. HOLD-OUT VALIDATIONS
+# ==============================
+
+results = []
+
+splits = [(0.3, "70:30"), (0.2, "80:20"), (0.1, "90:10")]
+
+for test_size, name in splits:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, stratify=y, random_state=42)
+
+    acc, train_t, test_t = evaluate_model(
+        X_train, X_test, y_train, y_test, name)
+
+    results.append(acc)
+
+# ==============================
+# 7. K-FOLD CROSS VALIDATION
+# ==============================
+
+def cross_validation(k):
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+
+    accuracies = []
+    train_times = []
+    test_times = []
+
+    fold = 1
+
+    for train_idx, test_idx in skf.split(X, y):
+        print(f"\nFold {fold}/{k}")
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        acc, train_t, test_t = evaluate_model(
+            X_train, X_test, y_train, y_test, f"{k}-Fold CV (Fold {fold})")
+
+        accuracies.append(acc)
+        train_times.append(train_t)
+        test_times.append(test_t)
+
+        fold += 1
+
+    return accuracies, train_times, test_times
+
+# 5-Fold
+acc_5cv, train_5cv, test_5cv = cross_validation(5)
+
+# 10-Fold
+acc_10cv, train_10cv, test_10cv = cross_validation(10)
+
+# ==============================
+# 8. STATISTICAL ANALYSIS
+# ==============================
+
+def compute_stats(acc_list, name):
+    mean_acc = np.mean(acc_list)
+    std_acc = np.std(acc_list)
+
+    ci = stats.t.interval(
+        confidence=0.95,
+        df=len(acc_list)-1,
+        loc=mean_acc,
+        scale=stats.sem(acc_list)
+    )
+
+    print(f"\n=== Statistical Results ({name}) ===")
+    print(f"Mean Accuracy: {mean_acc:.4f}")
+    print(f"Std Dev: {std_acc:.4f}")
+    print(f"95% Confidence Interval: {ci}")
+
+compute_stats(acc_5cv, "5-Fold CV")
+compute_stats(acc_10cv, "10-Fold CV")
+
+# ==============================
+# 9. COMPUTATIONAL COMPLEXITY
+# ==============================
+
+print("\n=== Computational Complexity Analysis ===")
+
+print("""
+k-NN:
+- Training Complexity: O(1)
+- Prediction Complexity: O(n * d)
+
+Decision Tree:
+- Training: O(n log n)
+- Prediction: O(log n)
+
+Gradient Boosting:
+- Training: O(M * n log n)
+- Prediction: O(M)
+
+Where:
+n = number of samples
+d = number of features
+M = number of trees
+
+Ensemble (Hard Voting):
+- Training: Sum of individual models
+- Prediction: Sum + voting aggregation
+
+CPU Efficiency:
+- Lightweight due to low-dimensional GLCM features (6 features only)
+- No GPU required
+""")
